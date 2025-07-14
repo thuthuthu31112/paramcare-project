@@ -1,0 +1,253 @@
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(MASS)
+library(fitdistrplus)
+library(ggplot2)
+library(ggcorrplot)
+library(scales)
+
+# Create output directory
+if (!dir.exists("output")) dir.create("output")
+
+# Define color theme
+main_color <- "lightsteelblue"
+accent_color <- "steelblue"
+reference_color <- "tomato"
+fill_color <- "lightsteelblue1"
+
+analyze_country <- function(file_path, country_name) {
+  message(paste("🔍 Analyzing:", country_name))
+  
+  # Read and clean data
+  healthcare <- read_excel(file_path, sheet = "healthcare") %>% clean_names()
+  cholesterol <- read_excel(file_path, sheet = "cholesterol") %>% clean_names()
+  blood <- read_excel(file_path, sheet = "blood") %>% clean_names()
+  diabetes <- read_excel(file_path, sheet = "diabetes") %>% clean_names()
+  
+  healthcare <- healthcare %>%
+    mutate(health_expenditure = gsub("[^0-9.]", "", healthcare_spending_per_person),
+           health_expenditure = as.numeric(health_expenditure)) %>%
+    filter(!is.na(health_expenditure)) %>%
+    dplyr::select(year, health_expenditure)
+  
+  cholesterol <- cholesterol %>%
+    mutate(cholesterol = rowMeans(dplyr::select(., male_non_hdl, female_non_hdl), na.rm = TRUE)) %>%
+    dplyr::select(year, cholesterol)
+  
+  blood <- blood %>%
+    mutate(blood_pressure = rowMeans(dplyr::select(., male_systolic, female_systolic), na.rm = TRUE)) %>%
+    dplyr::select(year, blood_pressure)
+  
+  diabetes <- diabetes %>%
+    mutate(across(c(male, female), ~ as.numeric(gsub("%", "", .)))) %>%
+    mutate(diabetes = rowMeans(dplyr::select(., male, female), na.rm = TRUE)) %>%
+    dplyr::select(year, diabetes)
+  
+  # Merge data
+  data <- blood %>%
+    inner_join(cholesterol, by = "year") %>%
+    inner_join(diabetes, by = "year") %>%
+    inner_join(healthcare, by = "year") %>%
+    drop_na()
+  
+  # Standardize data for PCA
+  standardized_data <- data %>%
+    mutate(across(c(blood_pressure, cholesterol, diabetes), ~ scale(.)[, 1]))
+  
+  # Calculate correlation matrix
+  corr_matrix <- cor(dplyr::select(standardized_data, blood_pressure, cholesterol, diabetes))
+  rownames(corr_matrix) <- c("Blood Pressure", "Cholesterol", "Diabetes")
+  colnames(corr_matrix) <- c("Blood Pressure", "Cholesterol", "Diabetes")
+  
+  # Create formatted correlation table
+  corr_table <- as.data.frame(corr_matrix) %>%
+    tibble::rownames_to_column("Variable") %>%
+    mutate(across(where(is.numeric), ~ round(., 3)))
+  
+  # 1. Correlation Plot
+  ggcorrplot(corr_matrix, method = "circle", type = "lower", lab = TRUE,
+             title = paste("Correlation Matrix -", country_name),
+             colors = c(fill_color, "white", accent_color),
+             ggtheme = theme_minimal()) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color),
+          panel.grid = element_blank())
+  ggsave(paste0("output/correlation_", country_name, ".png"), width = 6, height = 5, dpi = 300)
+  
+  # PCA analysis
+  pca <- prcomp(dplyr::select(standardized_data, blood_pressure, cholesterol, diabetes), center = TRUE)
+  weights <- pca$rotation[, 1, drop = FALSE]
+  health_index <- as.vector(as.matrix(dplyr::select(standardized_data, blood_pressure, cholesterol, diabetes)) %*% weights)
+  
+  # 2. PCA Variance Plot
+  pca_var <- data.frame(
+    PC = paste0("PC", 1:length(pca$sdev)),
+    Variance = pca$sdev^2 / sum(pca$sdev^2)
+  )
+  ggplot(pca_var, aes(x = PC, y = Variance)) +
+    geom_bar(stat = "identity", fill = main_color, alpha = 0.8) +
+    geom_text(aes(label = percent(Variance, accuracy = 0.1)), 
+              vjust = -0.5, size = 3.5, color = accent_color) +
+    labs(title = paste("PCA Analysis -", country_name),
+         y = "Explained Variance Proportion", x = "Principal Component") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color),
+          axis.title = element_text(color = accent_color),
+          axis.text = element_text(color = main_color))
+  ggsave(paste0("output/pca_variance_", country_name, ".png"), width = 6, height = 5, dpi = 300)
+  
+  # Regression analysis
+  lm_data <- data.frame(health_index = health_index, health_expenditure = data$health_expenditure)
+  model <- lm(health_expenditure ~ health_index, data = lm_data)
+  
+  # 3. Regression Plot
+  ggplot(lm_data, aes(x = health_index, y = health_expenditure)) +
+    geom_point(color = main_color, alpha = 0.6, size = 2.5) +
+    geom_smooth(method = "lm", color = accent_color, se = FALSE, size = 1.2) +
+    labs(title = paste("Health Expenditure vs. Health Index -", country_name),
+         x = "Health Index (PCA)", y = "Health Expenditure") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color, size = 12),
+          axis.title = element_text(color = accent_color),
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.background = element_rect(fill = "white", color = NA))
+  ggsave(paste0("output/regression_", country_name, ".png"), width = 7, height = 5, dpi = 300)
+  
+  # Simulation
+  set.seed(123)
+  n <- 5000
+  mu <- colMeans(dplyr::select(data, blood_pressure, cholesterol, diabetes))
+  sigma <- cov(dplyr::select(data, blood_pressure, cholesterol, diabetes))
+  
+  simulated_data <- mvrnorm(n, mu = mu, Sigma = sigma)
+  simulated_health_index <- as.vector(simulated_data %*% weights)
+  
+  simulated_expenditure <- as.vector(
+    model$coefficients[1] +
+      model$coefficients[2] * simulated_health_index +
+      rnorm(n, mean = 0, sd = summary(model)$sigma)
+  )
+  
+  # 4. Simulated Expenditure Distribution
+  ggplot(data.frame(simulated_expenditure), aes(x = simulated_expenditure)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = fill_color, alpha = 0.7) +
+    geom_density(color = accent_color, size = 1) +
+    labs(title = paste("Simulated Health Expenditure Distribution -", country_name),
+         x = "Health Expenditure", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color),
+          panel.grid.minor = element_blank())
+  ggsave(paste0("output/simulated_expenditure_", country_name, ".png"), width = 7, height = 5, dpi = 300)
+  
+  # Insurance claims calculation
+  fit <- fitdist(simulated_expenditure, "norm")
+  threshold <- fit$estimate["mean"] + 0.5 * fit$estimate["sd"]
+  health_threshold <- (threshold - model$coefficients[1]) / model$coefficients[2]
+  
+  claims <- ifelse(simulated_health_index <= health_threshold, 0,
+                   240.25 * (simulated_health_index - health_threshold))
+  
+  premium <- quantile(claims, probs = 0.9)
+  profit <- premium - claims
+  
+  # 5. Claims Distribution
+  ggplot(data.frame(claims), aes(x = claims)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = fill_color, alpha = 0.7) +
+    geom_vline(xintercept = premium, color = reference_color, linetype = "dashed", size = 1) +
+    annotate("text", x = premium, y = 0, label = paste("Premium:", dollar(round(premium, 2))),
+             vjust = -1, hjust = -0.1, color = reference_color) +
+    labs(title = paste("Insurance Claims Distribution -", country_name),
+         x = "Claim Amount", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color))
+  ggsave(paste0("output/claims_distribution_", country_name, ".png"), width = 7, height = 5, dpi = 300)
+  
+  # 6. Profit Distribution
+  ggplot(data.frame(profit), aes(x = profit)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = fill_color, alpha = 0.7) +
+    geom_vline(xintercept = 0, color = reference_color, linetype = "dashed", size = 1) +
+    labs(title = paste("Profit Distribution (Premium - Claims) -", country_name),
+         x = "Profit", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color))
+  ggsave(paste0("output/profit_distribution_", country_name, ".png"), width = 7, height = 5, dpi = 300)
+  
+  # 7. ECDF of Profit
+  ggplot(data.frame(profit), aes(x = profit)) +
+    stat_ecdf(geom = "step", color = accent_color, size = 1) +
+    geom_hline(yintercept = 0.05, color = reference_color, linetype = "dashed") +
+    geom_vline(xintercept = 0, color = reference_color, linetype = "dashed") +
+    labs(title = paste("Profit ECDF -", country_name),
+         x = "Profit", y = "Cumulative Probability") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", color = accent_color),
+          panel.grid.minor = element_blank())
+  ggsave(paste0("output/profit_ecdf_", country_name, ".png"), width = 7, height = 5, dpi = 300)
+  
+  # Create comprehensive simulation results data frame
+  simulation_results <- data.frame(
+    simulated_health_index = simulated_health_index,
+    simulated_expenditure = simulated_expenditure,
+    health_threshold = health_threshold,
+    claims = claims,
+    premium = premium,
+    profit = profit
+  )
+  
+  # Save simulation results to CSV
+  sim_file <- paste0("output/simulation_results_", country_name, ".csv")
+  write.csv(simulation_results, sim_file, row.names = FALSE)
+  
+  return(list(
+    country = country_name,
+    correlation_matrix = corr_matrix,
+    correlation_table = corr_table,
+    premium = premium,
+    avg_profit = mean(profit),
+    sd_profit = sd(profit),
+    loss_probability = mean(profit < 0),
+    health_threshold = health_threshold,
+    simulated_health_index = simulated_health_index,
+    simulation_results = simulation_results,
+    simulation_results_file = sim_file,
+    output_files = c(
+      list.files("output", pattern = paste0(".*_", country_name, "\\.png$"), full.names = TRUE),
+      sim_file
+    )
+  ))
+}
+
+# Analyze both countries
+results_palominia <- analyze_country("C:/Users/ADMIN/OneDrive/Tài liệu/PROJECTS/DA/SOA/palominia.xlsx", "Palominia")
+results_ambernia <- analyze_country("C:/Users/ADMIN/OneDrive/Tài liệu/PROJECTS/DA/SOA/ambernia.xlsx", "Ambernia")
+
+# Display correlation results
+cat("\nCorrelation Results:\n")
+cat("--------------------\n")
+cat("Palominia:\n")
+print(results_palominia$correlation_table)
+cat("\nAmbernia:\n")
+print(results_ambernia$correlation_table)
+
+# Compare results
+comparison <- data.frame(
+  Country = c(results_palominia$country, results_ambernia$country),
+  Premium = c(results_palominia$premium, results_ambernia$premium),
+  Avg_Profit = c(results_palominia$avg_profit, results_ambernia$avg_profit),
+  Loss_Probability = c(results_palominia$loss_probability, results_ambernia$loss_probability),
+  Health_Threshold = c(results_palominia$health_threshold, results_ambernia$health_threshold)
+)
+
+# Print comparison results
+cat("\nComparison Results:\n")
+cat("-------------------\n")
+print(comparison)
+
+# Save comparison results
+write.csv(comparison, "output/comparison_results.csv", row.names = FALSE)
+
+# Save correlation matrices
+write.csv(results_palominia$correlation_matrix, "output/correlation_matrix_palominia.csv", row.names = TRUE)
+write.csv(results_ambernia$correlation_matrix, "output/correlation_matrix_ambernia.csv", row.names = TRUE)
